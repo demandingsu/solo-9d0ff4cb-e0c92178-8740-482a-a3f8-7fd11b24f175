@@ -216,4 +216,29 @@ req "$COLLECTOR/papers?include_retracted=true" \
 say "Job history:"
 req "$COLLECTOR/sync/jobs" | jq -r '.[] | "  job \(.id): \(.status) pages=\(.pages_fetched) resets=\(.cursor_resets) [\(.interval_start), \(.interval_end)]"'
 
+# ---------------------------------------------------------------------------
+hr "6. Collection snapshot for the offline archive (NDJSON + SHA-256)"
+# ---------------------------------------------------------------------------
+say "Generate a consistent snapshot of the whole published library"
+SNAP=$(req -X POST "$COLLECTOR/snapshots")
+echo "$SNAP" | jq '{id, status, record_count, sha256, download_url}'
+SNAP_ID=$(echo "$SNAP" | jq -r .id)
+SNAP_SHA=$(echo "$SNAP" | jq -r .sha256)
+
+say "List completed snapshots (only finished ones are visible)"
+req "$COLLECTOR/snapshots" | jq -r '.[] | "  snapshot \(.id): \(.record_count) records sha256=\(.sha256[0:16])..."'
+
+say "Download by snapshot number and verify the SHA-256"
+OUT="/tmp/snapshot-$SNAP_ID.ndjson"
+req "$COLLECTOR/snapshots/$SNAP_ID/download" -o "$OUT"
+LOCAL_SHA=$(sha256sum "$OUT" | awk '{print $1}')
+echo "  registered: $SNAP_SHA"
+echo "  downloaded: $LOCAL_SHA"
+[ "$LOCAL_SHA" = "$SNAP_SHA" ] && echo "  OK: checksums match" || { echo "checksum mismatch" >&2; exit 1; }
+
+say "Snapshot content (one paper per line; retracted papers are included)"
+head -n 3 "$OUT" | jq -c .
+say "Retracted papers inside the snapshot:"
+jq -r 'select(.is_retracted==1) | "  \(.paper_id) rev=\(.rev) retracted=\(.is_retracted)"' "$OUT"
+
 hr "Demo complete"

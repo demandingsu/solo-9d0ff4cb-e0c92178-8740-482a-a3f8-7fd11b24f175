@@ -66,6 +66,20 @@ CREATE TABLE IF NOT EXISTS papers (
     changed_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
 );
+
+-- Registry of collection snapshots (NDJSON dumps for the offline archive).
+-- A row becomes externally visible only when it reaches 'completed', which
+-- happens strictly after the snapshot file is fully written and renamed.
+CREATE TABLE IF NOT EXISTS snapshots (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    status        TEXT NOT NULL CHECK (status IN ('generating','completed','failed')),
+    record_count  INTEGER,
+    sha256        TEXT,
+    file_name     TEXT,
+    error         TEXT,
+    created_at    TEXT NOT NULL,
+    completed_at  TEXT
+);
 """
 
 _lock = threading.Lock()
@@ -102,6 +116,10 @@ def init_db(db_path: str | None = None) -> None:
                 "WHERE status IN ('collecting','committing')",
                 (utc_now_iso(),),
             )
+            # A process killed mid-snapshot leaves 'generating' registrations
+            # that can never complete; drop them so they stay invisible.
+            # Stray files on disk are reclaimed by snapshots.cleanup_residue.
+            conn.execute("DELETE FROM snapshots WHERE status='generating'")
             conn.commit()
         finally:
             conn.close()
@@ -306,3 +324,54 @@ def count_papers(conn: sqlite3.Connection, include_retracted: bool) -> int:
     if not include_retracted:
         sql += " WHERE is_retracted=0"
     return int(conn.execute(sql).fetchone()["c"])
+
+
+# --------------------------------------------------------------------------- #
+# collection snapshots
+# --------------------------------------------------------------------------- #
+def create_snapshot(conn: sqlite3.Connection) -> int:
+    """Reserve a snapshot id with status 'generating' (not yet visible)."""
+    cur = conn.execute(
+        "INSERT INTO snapshots (status, created_at) VALUES ('generating', ?)",
+        (utc_now_iso(),),
+    )
+    return int(cur.lastrowid)
+
+
+def complete_snapshot(conn: sqlite3.Connection, snapshot_id: int,
+                      record_count: int, sha256: str, file_name: str) -> None:
+    """Flip a snapshot to 'completed' — the moment it becomes visible."""
+    conn.execute(
+        "UPDATE snapshots SET status='completed', record_count=?, sha256=?, "
+        "file_name=?, completed_at=? WHERE id=?",
+        (record_count, sha256, file_name, utc_now_iso(), snapshot_id),
+    )
+
+
+def fail_snapshot(conn: sqlite3.Connection, snapshot_id: int, error: str) -> None:
+    """Record a failed generation for audit; never exposed by the API."""
+    conn.execute(
+        "UPDATE snapshots SET status='failed', error=? WHERE id=?",
+        (error, snapshot_id),
+    )
+
+
+def get_snapshot(conn: sqlite3.Connection, snapshot_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM snapshots WHERE id=?", (snapshot_id,)
+    ).fetchone()
+
+
+def list_completed_snapshots(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Only completed snapshots are externally visible."""
+    return list(conn.execute(
+        "SELECT * FROM snapshots WHERE status='completed' ORDER BY id DESC"
+    ))
+
+
+def completed_snapshot_filenames(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute(
+        "SELECT file_name FROM snapshots "
+        "WHERE status='completed' AND file_name IS NOT NULL"
+    )
+    return {row["file_name"] for row in rows}

@@ -46,3 +46,14 @@ class PaperResponse(BaseModel):
     is_retracted: int
     changed_at: str
     updated_at: str
+
+
+class SnapshotResponse(BaseModel):
+    id: int
+    status: str
+    record_count: int
+    sha256: str
+    file_name: str
+    download_url: str
+    created_at: str
+    completed_at: str

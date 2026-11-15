@@ -9,6 +9,11 @@ POST   /sync/jobs/{id}/resume  resume a failed/interrupted job
 GET    /sync/state             last completed interval and completion time
 GET    /papers                 query library (retracted hidden by default)
 GET    /papers/{paper_id}      lookup one paper (410 when retracted)
+POST   /snapshots              dump the published library to NDJSON (consistent,
+                               retracted included) and return count + SHA-256
+GET    /snapshots              list completed snapshots
+GET    /snapshots/{id}         snapshot metadata (record count, SHA-256)
+GET    /snapshots/{id}/download  download the snapshot NDJSON file
 """
 from __future__ import annotations
 
@@ -17,17 +22,28 @@ import sqlite3
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
 
-from . import db, sync
-from .schemas import CreateJobRequest, JobResponse, PaperResponse, StateResponse
+from . import db, snapshots, sync
+from .schemas import (
+    CreateJobRequest,
+    JobResponse,
+    PaperResponse,
+    SnapshotResponse,
+    StateResponse,
+)
 
 DB_PATH = os.getenv("COLLECTOR_DB", "/data/collector.db")
+SNAPSHOT_DIR = os.getenv("SNAPSHOT_DIR", "/data/snapshots")
 DEFAULT_SOURCE_URL = os.getenv("SOURCE_URL", "http://source:8000")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db(DB_PATH)
+    # Reclaim half-finished snapshot residue from a previous run; completed
+    # snapshots keep working across restarts.
+    snapshots.cleanup_residue(DB_PATH, SNAPSHOT_DIR)
     yield
 
 
@@ -214,3 +230,88 @@ def papers_count(include_retracted: bool = Query(False)) -> dict:
         return {"count": db.count_papers(conn, include_retracted)}
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# collection snapshots (handover to the offline preservation archive)
+# --------------------------------------------------------------------------- #
+def _snapshot_response(row: sqlite3.Row) -> SnapshotResponse:
+    return SnapshotResponse(
+        id=row["id"],
+        status=row["status"],
+        record_count=row["record_count"],
+        sha256=row["sha256"],
+        file_name=row["file_name"],
+        download_url=f"/snapshots/{row['id']}/download",
+        created_at=row["created_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+@app.post("/snapshots", status_code=201, response_model=SnapshotResponse)
+def create_snapshot() -> SnapshotResponse:
+    """Dump the whole published library (retracted papers included) to NDJSON.
+
+    The dump reads one consistent WAL snapshot of the library: an incremental
+    sync committing mid-dump never leaks newer revisions into the file. Rows
+    stream to disk one at a time; the file and its registration become
+    visible only after both are fully written.
+    """
+    try:
+        row = snapshots.generate(DB_PATH, SNAPSHOT_DIR)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"snapshot generation failed: {exc}"
+        )
+    return _snapshot_response(row)
+
+
+@app.get("/snapshots", response_model=list[SnapshotResponse])
+def list_snapshots() -> list[SnapshotResponse]:
+    conn = _conn()
+    try:
+        return [_snapshot_response(r) for r in db.list_completed_snapshots(conn)]
+    finally:
+        conn.close()
+
+
+@app.get("/snapshots/{snapshot_id}", response_model=SnapshotResponse)
+def get_snapshot(snapshot_id: int) -> SnapshotResponse:
+    conn = _conn()
+    try:
+        row = db.get_snapshot(conn, snapshot_id)
+        if row is None or row["status"] != "completed":
+            # Incomplete registrations are never externally visible.
+            raise HTTPException(status_code=404, detail="snapshot not found")
+        return _snapshot_response(row)
+    finally:
+        conn.close()
+
+
+@app.get("/snapshots/{snapshot_id}/download")
+def download_snapshot(snapshot_id: int) -> FileResponse:
+    conn = _conn()
+    try:
+        row = db.get_snapshot(conn, snapshot_id)
+        if row is None or row["status"] != "completed":
+            raise HTTPException(status_code=404, detail="snapshot not found")
+        file_name = row["file_name"]
+        sha256 = row["sha256"]
+        record_count = row["record_count"]
+    finally:
+        conn.close()
+
+    path = os.path.join(SNAPSHOT_DIR, file_name)
+    if not os.path.isfile(path):
+        raise HTTPException(
+            status_code=404, detail="snapshot file is missing from storage"
+        )
+    return FileResponse(
+        path,
+        media_type="application/x-ndjson",
+        filename=file_name,
+        headers={
+            "X-Snapshot-SHA256": sha256,
+            "X-Snapshot-Record-Count": str(record_count),
+        },
+    )

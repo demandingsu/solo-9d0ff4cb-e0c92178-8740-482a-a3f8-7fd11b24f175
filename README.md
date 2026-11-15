@@ -3,6 +3,8 @@
 把机构知识库（源）中论文的**新增 / 修订 / 撤回**同步到检索库（采集端），
 保证撤回论文不再被检出。FastAPI + SQLite 实现，`docker compose` 一键启动，
 内置一个**无需账号的本地知识库源**，可演示修订、撤回、断线续采与游标过期。
+采集端还可把当前论文目录导出为**一致性馆藏快照**（NDJSON + SHA-256），
+交付离线保存库并供日后核对。
 
 ## 目录结构
 
@@ -15,14 +17,15 @@
 │   └── app/
 │       ├── data.py           # 不可改写的变更事件种子数据（含乱序、重复、旧版重投）
 │       └── main.py           # /changes 变更流、/control/* 演示控制、/events
-├── collector/                # 采集端：采集 API、暂存、原子发布、可查询论文库
+├── collector/                # 采集端：采集 API、暂存、原子发布、可查询论文库、馆藏快照
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── app/
-│       ├── db.py             # SQLite 表结构、暂存去重、撤回粘性、原子发布
+│       ├── db.py             # SQLite 表结构、暂存去重、撤回粘性、原子发布、快照登记
 │       ├── sync.py           # 分页拉取、每页检查点、410 重取原区间、后台 worker
+│       ├── snapshots.py      # 一致性 NDJSON 快照：流式写出、原子可见、残留清理
 │       ├── schemas.py
-│       └── main.py           # 采集 / 续采 / 查询 HTTP API
+│       └── main.py           # 采集 / 续采 / 查询 / 快照 HTTP API
 ├── tests/                    # pytest（httpx MockTransport，无需起服务）
 ├── demo/demo.sh              # 端到端演示脚本
 └── requirements-dev.txt      # 本地测试依赖
@@ -51,6 +54,10 @@ docker compose up -d --build
 | 整区间取齐才一起更新论文库与完成时间 | 全部页 `done` 后，在**单事务**内把暂存发布到 `papers` 并写 `sync_state.completed_at`；任一步失败整体回滚 |
 | 失败时旧库可查、暂存不可见 | 暂存表 `staged_changes` 与查询表 `papers` 物理隔离；查询 API 只读 `papers`，未发布的暂存对外完全不可见 |
 | 撤回论文不被检出 | `GET /papers` 默认隐藏 `is_retracted=1`；`GET /papers/{id}` 对撤回论文返回 **HTTP 410 Gone**（加 `?include_retracted=true` 可审计查看） |
+| 快照对应"开始读取时"的一版馆藏 | 快照在**单个 WAL 读事务**内流式导出：生成期间增量采集提交的新修订不会混入文件，新旧修订绝不混杂 |
+| 快照不整库载入内存 | 游标逐行读取 `papers`、逐行写 NDJSON、逐行更新 SHA-256，内存占用与库大小无关 |
+| 快照完整才对可见，半成品不可下载 | 先写 `.part` 临时文件 → fsync → 原子改名 → 最后才把登记置为 `completed`；API 只暴露 `completed` 快照，失败即清理临时文件 |
+| 重启后清理残留、成功快照继续可用 | 启动时删除卡在 `generating` 的登记、孤儿 `*.part` / 未登记文件；`completed` 快照（登记 + 文件）原样保留 |
 
 > `completed_at` 记录的是本次**区间结束时间**（下次拉取的变更时间基线），
 > 而不是墙上时钟，否则回填历史区间时增量起点会晚于历史 `end` 而无法重取。
@@ -67,6 +74,10 @@ docker compose up -d --build
 | `GET /papers` | 论文列表，默认隐藏撤回；`?include_retracted=true` 可包含 |
 | `GET /papers/{id}` | 按编号查询；撤回论文返回 410 |
 | `GET /papers-count` | 计数 |
+| `POST /snapshots` | 生成馆藏快照：整个已发布论文库（含撤回论文及其状态）逐行写 NDJSON，返回记录数与 SHA-256 |
+| `GET /snapshots` | 已完成快照列表（只有全部完成的快照才对外可见） |
+| `GET /snapshots/{id}` | 单个快照元数据（记录数、SHA-256、完成时间） |
+| `GET /snapshots/{id}/download` | 按快照号下载 NDJSON 文件（响应头带 `X-Snapshot-SHA256` 供核对） |
 
 任务状态机：`collecting → committing → completed`；异常进入 `failed`，
 进程在途崩溃在重启时变为 `interrupted`，二者均可 `resume`。
@@ -106,6 +117,11 @@ curl -X POST localhost:8001/sync/jobs/2/resume
 curl -X POST localhost:8000/control/expire-after -H 'Content-Type: application/json' -d '{"requests":1}'
 curl -X POST localhost:8001/sync/jobs -H 'Content-Type: application/json' \
   -d '{"end":"2026-11-11T23:59:59Z"}'       # cursor_resets=1，再 resume
+
+# 4) 馆藏快照：生成、按号下载、核对 SHA-256（含撤回论文）
+curl -X POST localhost:8001/snapshots      # => {"id":1,"record_count":N,"sha256":"...",...}
+curl localhost:8001/snapshots/1/download -o snapshot-1.ndjson
+sha256sum snapshot-1.ndjson                # 与登记的 sha256 一致
 ```
 
 ## 本地测试（不依赖 Docker）
@@ -116,11 +132,16 @@ PYTHONPATH=. python -m pytest -q
 ```
 
 覆盖：分页乱序/重复去重、最高修订胜出、撤回粘性与 410、失败时旧库可查且暂存
-不可见、续采、游标过期重取原区间、重启后 interrupted 翻转、源端非重入锁回归等。
+不可见、续采、游标过期重取原区间、重启后 interrupted 翻转、源端非重入锁回归，
+以及馆藏快照：撤回论文入快照、SHA-256 可核对、生成期间增量发布不混入、
+失败无残留、重启清理与既有快照保留。
 
 ## 数据安全与隔离说明
 
-- 采集端 SQLite（WAL 模式）放在命名卷 `collector_data`，容器重启不丢检查点。
+- 采集端 SQLite（WAL 模式）与快照文件都放在命名卷 `collector_data`
+  （`/data/collector.db` 与 `/data/snapshots/`），容器重启不丢检查点与快照。
 - 源端事件为 append-only 不可改写；采集端不修改源数据，只做拉取与本地发布。
-- 所有"对外可见"的只有 `papers` 表；`staged_changes`、`jobs`、`sync_state`
-  仅服务于同步过程与运维观测。
+- 所有"对外可见"的只有 `papers` 表与 `completed` 快照；`staged_changes`、
+  `jobs`、`sync_state` 及未完成的快照登记仅服务于同步过程与运维观测。
+- 快照导出走独立只读连接（`PRAGMA query_only`），单读事务保证一致性，
+  不会阻塞或污染正在进行的增量采集。

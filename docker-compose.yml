@@ -20,6 +20,8 @@ services:
         condition: service_healthy
     environment:
       COLLECTOR_DB: "/data/collector.db"
+      # Snapshot NDJSON files live on the same persistent volume as the DB.
+      SNAPSHOT_DIR: "/data/snapshots"
       SOURCE_URL: "http://source:8000"
     ports:
       - "8001:8001"
