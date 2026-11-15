@@ -1,0 +1,35 @@
+services:
+  source:
+    build: ./source
+    environment:
+      # Short TTL so the cursor-expiry demo does not need long waits.
+      CURSOR_TTL_SECONDS: "60"
+      SOURCE_PAGE_SIZE: "3"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  collector:
+    build: ./collector
+    depends_on:
+      source:
+        condition: service_healthy
+    environment:
+      COLLECTOR_DB: "/data/collector.db"
+      SOURCE_URL: "http://source:8000"
+    ports:
+      - "8001:8001"
+    volumes:
+      - collector_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  collector_data:
